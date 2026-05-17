@@ -30,27 +30,27 @@ client = TelegramClient('digest_session', int(API_ID), API_HASH)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 database.init_db()
 
-async def generate_digest_summary(text_content: str) -> str:
+async def generate_digest_summary(chat_title: str, text_content: str) -> str:
     if not text_content.strip():
-        return "No new messages."
+        return ""
     
     prompt = (
-        "You are an expert assistant. Summarize the key discussions, announcements, and highlights "
-        "from the following chat messages. Group the summary by Chat Title and present it clearly using Markdown.\n\n"
-        f"{text_content}"
+        f"You are an expert assistant. Summarize the key discussions, announcements, and highlights "
+        f"specifically for the Telegram chat: '{chat_title}'.\n\n"
+        "Please provide a clear, concise summary using Markdown. Focus on the most important information.\n\n"
+        f"Messages:\n{text_content}"
     )
     
     try:
         # Note: Using gemini-2.5-pro as it's the current recommended model for general tasks
-        # You mentioned Gemini 3.1 Pro, if that specific model string is available in your project/org, you can replace it here.
         response = gemini_client.models.generate_content(
             model='gemini-2.5-pro',
             contents=prompt,
         )
-        return response.text
+        return f"### {chat_title}\n{response.text.strip()}"
     except Exception as e:
-        logger.error(f"Error generating summary with Gemini: {e}")
-        return "Error: Could not generate summary due to an API error."
+        logger.error(f"Error generating summary for {chat_title}: {e}")
+        return f"### {chat_title}\nError: Could not generate summary due to an API error."
 
 async def fetch_messages_and_digest():
     logger.info("Starting digest generation...")
@@ -62,60 +62,51 @@ async def fetch_messages_and_digest():
     last_run = database.get_last_run_timestamp()
     last_run_dt = datetime.fromtimestamp(last_run, tz=timezone.utc) if last_run > 0 else None
     
-    messages_by_chat = {}
+    summary_tasks = []
+    has_new_messages = False
     
     for chat_info in target_chats:
         chat_id = chat_info['chat_id']
         chat_title = chat_info['chat_title']
-        messages_by_chat[chat_title] = []
+        chat_messages = []
         
         try:
-            # Fetch messages since last run. If last_run is 0, just fetch last 100 to avoid huge backlog on first run
             limit = None if last_run > 0 else 100
-            offset_date = last_run_dt if last_run > 0 else None
-            
-            # Using iter_messages with offset_date
-            # Note: telethon's offset_date gets messages OLDER than the date. 
-            # We want NEWER than last_run_dt.
-            # We can use reverse=True and offset_date to get messages AFTER a date, but it might be easier to fetch and break.
-            
             async for message in client.iter_messages(chat_id, limit=limit):
                 if last_run_dt and message.date and message.date <= last_run_dt:
-                    break # We reached messages we already processed
+                    break
                 
                 if message.text:
                     sender = await message.get_sender()
                     sender_name = sender.username or sender.first_name or "Unknown" if sender else "Unknown"
                     msg_time = message.date.strftime("%Y-%m-%d %H:%M:%S")
-                    messages_by_chat[chat_title].append(f"[{msg_time}] {sender_name}: {message.text}")
+                    chat_messages.append(f"[{msg_time}] {sender_name}: {message.text}")
                     
         except Exception as e:
             logger.error(f"Error fetching from {chat_title} ({chat_id}): {e}")
 
-    # Compile the prompt content
-    compiled_text = ""
-    total_messages = 0
-    for chat_title, msgs in messages_by_chat.items():
-        if msgs:
-            # Messages are fetched newest to oldest, reverse them for chronological order
-            msgs.reverse()
-            compiled_text += f"--- Chat: {chat_title} ---\n"
-            compiled_text += "\n".join(msgs)
-            compiled_text += "\n\n"
-            total_messages += len(msgs)
+        if chat_messages:
+            has_new_messages = True
+            chat_messages.reverse() # chronological
+            compiled_chat_text = "\n".join(chat_messages)
+            summary_tasks.append(generate_digest_summary(chat_title, compiled_chat_text))
 
-    if total_messages == 0:
+    if not has_new_messages:
         logger.info("No new messages found.")
         database.update_last_run_timestamp(int(datetime.now(timezone.utc).timestamp()))
         return "No new messages in the tracked chats since the last digest."
     
-    summary = await generate_digest_summary(compiled_text)
+    # Generate summaries in parallel
+    individual_summaries = await asyncio.gather(*summary_tasks)
+    
+    # Filter out empty results and join
+    full_summary = "\n\n".join([s for s in individual_summaries if s])
     
     # Update state
     database.update_last_run_timestamp(int(datetime.now(timezone.utc).timestamp()))
     
     logger.info("Digest generation complete.")
-    return f"**Daily Digest**\n\n{summary}"
+    return f"**Daily Digest**\n\n{full_summary}"
 
 async def send_digest():
     summary_text = await fetch_messages_and_digest()
