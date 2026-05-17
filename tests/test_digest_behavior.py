@@ -1,5 +1,7 @@
+import asyncio
 import importlib
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -23,8 +25,10 @@ def load_main(temp_dir):
     os.chdir(temp_dir)
     for module_name in ("main", "database"):
         sys.modules.pop(module_name, None)
-    module = importlib.import_module("main")
-    os.chdir(previous_cwd)
+    try:
+        module = importlib.import_module("main")
+    finally:
+        os.chdir(previous_cwd)
     return module
 
 
@@ -39,10 +43,11 @@ class FakeMessage:
 
 
 class FakeClient:
-    def __init__(self, messages_by_chat=None, *, send_error=None):
+    def __init__(self, messages_by_chat=None, *, send_error=None, fail_after=None):
         self.messages_by_chat = messages_by_chat or {}
         self.sent_messages = []
         self.send_error = send_error
+        self.fail_after = fail_after
 
     async def iter_messages(self, chat_id, limit=None):
         messages = self.messages_by_chat.get(chat_id, [])
@@ -52,6 +57,8 @@ class FakeClient:
             yield message
 
     async def send_message(self, peer, text):
+        if self.fail_after is not None and len(self.sent_messages) >= self.fail_after:
+            raise RuntimeError("send failed")
         if self.send_error:
             raise self.send_error
         self.sent_messages.append((peer, text))
@@ -114,6 +121,39 @@ class DigestBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({-1001, -1002}, set(fake_db.updated))
         self.assertTrue(all(timestamp > 0 for timestamp in fake_db.updated.values()))
 
+    async def test_scheduled_digest_splits_long_telegram_messages_before_sending(self):
+        fake_db = FakeDatabase()
+        self.main.database = fake_db
+        self.main.client = FakeClient()
+        self.main.MAX_TELEGRAM_MESSAGE_LENGTH = 50
+
+        async def fake_digest_result():
+            return self.main.DigestResult("A" * 120, {-1001: 456})
+
+        self.main.build_digest_result = fake_digest_result
+
+        await self.main.send_digest(advance_cursors=True)
+
+        sent_texts = [text for _, text in self.main.client.sent_messages]
+        self.assertEqual(["A" * 50, "A" * 50, "A" * 20], sent_texts)
+        self.assertEqual({-1001: 456}, fake_db.updated)
+
+    async def test_scheduled_digest_does_not_advance_cursors_when_split_send_fails(self):
+        fake_db = FakeDatabase()
+        self.main.database = fake_db
+        self.main.client = FakeClient(fail_after=1)
+        self.main.MAX_TELEGRAM_MESSAGE_LENGTH = 50
+
+        async def fake_digest_result():
+            return self.main.DigestResult("A" * 120, {-1001: 456})
+
+        self.main.build_digest_result = fake_digest_result
+
+        with self.assertRaises(RuntimeError):
+            await self.main.send_digest(advance_cursors=True)
+
+        self.assertEqual({}, fake_db.updated)
+
     async def test_scheduled_digest_does_not_advance_cursors_when_send_fails(self):
         fake_db = FakeDatabase()
         self.main.database = fake_db
@@ -131,6 +171,126 @@ class DigestBehaviorTests(unittest.IsolatedAsyncioTestCase):
             await self.main.send_digest(advance_cursors=True)
 
         self.assertEqual({}, fake_db.updated)
+
+    async def test_digest_splits_chat_input_before_summary_generation(self):
+        fake_db = FakeDatabase()
+        fake_db.targets = [
+            {"chat_id": -1001, "chat_title": "One", "last_digest_timestamp": 100},
+        ]
+        self.main.database = fake_db
+        self.main.MAX_GEMINI_INPUT_CHARS = 180
+        self.main.client = FakeClient({
+            -1001: [
+                FakeMessage("x" * 90, datetime.fromtimestamp(350, tz=timezone.utc), "alice"),
+                FakeMessage("y" * 90, datetime.fromtimestamp(300, tz=timezone.utc), "bob"),
+                FakeMessage("z" * 90, datetime.fromtimestamp(250, tz=timezone.utc), "carol"),
+            ],
+        })
+        summary_inputs = []
+
+        async def fake_summary(chat_title, text_content):
+            summary_inputs.append(text_content)
+            return f"### {chat_title}\nchunk {len(summary_inputs)}"
+
+        self.main.generate_digest_summary = fake_summary
+
+        result = await self.main.build_digest_result()
+
+        self.assertGreater(len(summary_inputs), 1)
+        self.assertTrue(all(len(text) <= self.main.MAX_GEMINI_INPUT_CHARS for text in summary_inputs))
+        self.assertIn(-1001, result.cursor_updates)
+
+    async def test_digest_excludes_messages_newer_than_run_snapshot(self):
+        fake_db = FakeDatabase()
+        fake_db.targets = [
+            {"chat_id": -1001, "chat_title": "One", "last_digest_timestamp": 100},
+        ]
+        self.main.database = fake_db
+
+        class FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.fromtimestamp(150.5, tz=tz)
+
+        self.main.datetime = FrozenDateTime
+        self.main.client = FakeClient({
+            -1001: [
+                FakeMessage("future item", datetime.fromtimestamp(151, tz=timezone.utc), "alice"),
+                FakeMessage("old item", datetime.fromtimestamp(140, tz=timezone.utc), "bob"),
+            ],
+        })
+        summary_inputs = []
+
+        async def fake_summary(chat_title, text_content):
+            summary_inputs.append(text_content)
+            return f"### {chat_title}\n{text_content}"
+
+        self.main.generate_digest_summary = fake_summary
+
+        result = await self.main.build_digest_result()
+
+        self.assertEqual(1, len(summary_inputs))
+        self.assertIn("old item", summary_inputs[0])
+        self.assertNotIn("future item", summary_inputs[0])
+        self.assertEqual({-1001: 150}, result.cursor_updates)
+
+    async def test_summary_generation_is_concurrency_limited(self):
+        fake_db = FakeDatabase()
+        fake_db.targets = [
+            {"chat_id": -1001, "chat_title": "One", "last_digest_timestamp": 100},
+        ]
+        self.main.database = fake_db
+        self.main.client = FakeClient({
+            -1001: [
+                FakeMessage(f"item {index} " + ("x" * 40), datetime.fromtimestamp(200 + index, tz=timezone.utc), "alice")
+                for index in range(8)
+            ],
+        })
+        self.main.MAX_GEMINI_INPUT_CHARS = 80
+        self.main.MAX_CONCURRENT_SUMMARIES = 2
+        active = 0
+        max_active = 0
+
+        async def fake_summary(chat_title, text_content):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return f"### {chat_title}\n{text_content}"
+
+        self.main.generate_digest_summary = fake_summary
+
+        await self.main.build_digest_result()
+
+        self.assertLessEqual(max_active, 2)
+
+    async def test_digest_reports_fetch_failures_without_advancing_failed_chat(self):
+        fake_db = FakeDatabase()
+        self.main.database = fake_db
+
+        class PartiallyFailingClient(FakeClient):
+            async def iter_messages(self, chat_id, limit=None):
+                if chat_id == -1002:
+                    raise RuntimeError("history unavailable")
+                async for message in super().iter_messages(chat_id, limit=limit):
+                    yield message
+
+        self.main.client = PartiallyFailingClient({
+            -1001: [FakeMessage("new item", datetime.fromtimestamp(150, tz=timezone.utc), "alice")],
+        })
+
+        async def fake_summary(chat_title, text_content):
+            return f"### {chat_title}\n{text_content}"
+
+        self.main.generate_digest_summary = fake_summary
+
+        result = await self.main.build_digest_result()
+
+        self.assertIn("Daily Digest", result.text)
+        self.assertIn("Could not fetch messages from Two", result.text)
+        self.assertIn(-1001, result.cursor_updates)
+        self.assertNotIn(-1002, result.cursor_updates)
 
     async def test_add_command_stores_marked_peer_id(self):
         added = []
@@ -211,6 +371,64 @@ class DigestBehaviorTests(unittest.IsolatedAsyncioTestCase):
             await self.main.add_command_handler(Event())
 
         self.assertEqual([(-100123, "Channel")], added)
+
+
+class ImportBehaviorTests(unittest.TestCase):
+    def test_load_main_restores_cwd_when_import_fails(self):
+        previous_cwd = os.getcwd()
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        try:
+            with patch("importlib.import_module", side_effect=ModuleNotFoundError("boom")):
+                with self.assertRaises(ModuleNotFoundError):
+                    load_main(temp_dir.name)
+
+            self.assertEqual(previous_cwd, os.getcwd())
+        finally:
+            os.chdir(previous_cwd)
+
+    def test_main_import_does_not_require_credentials(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        if str(PROJECT_ROOT) not in sys.path:
+            sys.path.insert(0, str(PROJECT_ROOT))
+
+        previous_cwd = os.getcwd()
+        os.chdir(temp_dir.name)
+        for module_name in ("main", "database"):
+            sys.modules.pop(module_name, None)
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                module = importlib.import_module("main")
+        finally:
+            os.chdir(previous_cwd)
+
+        self.assertIsNone(module.client)
+        self.assertIsNone(module.gemini_client)
+
+
+class ServiceSetupTests(unittest.TestCase):
+    def test_generated_systemd_unit_escapes_paths(self):
+        temp_dir = tempfile.TemporaryDirectory(prefix="digest bot %")
+        self.addCleanup(temp_dir.cleanup)
+        project_dir = Path(temp_dir.name)
+        python_path = project_dir / "venv" / "bin" / "python"
+        python_path.parent.mkdir(parents=True)
+        python_path.touch()
+
+        subprocess.run(
+            [str(PROJECT_ROOT / "setup_service.sh")],
+            cwd=project_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        service_content = (project_dir / "tg-digest-bot.service").read_text()
+
+        self.assertIn('WorkingDirectory="', service_content)
+        self.assertIn('ExecStart="', service_content)
+        self.assertIn("%%", service_content)
 
 
 class DatabaseTests(unittest.TestCase):

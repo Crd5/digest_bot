@@ -12,7 +12,7 @@ A Telegram user bot that uses Telethon and the Google Gemini API to analyze sele
 
 ## Prerequisites
 
-- Python 3.8 or higher.
+- Python 3.9 or higher.
 - A Telegram API ID and API Hash (obtain from [https://my.telegram.org/](https://my.telegram.org/)).
 - A Google Gemini API Key.
 
@@ -67,3 +67,11 @@ If you are running the bot on a Linux server, you can set it up as a `systemd` s
    - `/digest`: Preview a digest for messages received since the last scheduled digest. This does not affect the evening scheduled digest.
 
 The bot will also automatically generate and send a digest to your Saved Messages every day at 22:00 UTC+3. Each tracked chat keeps its own cursor, so a temporary failure in one chat does not advance the others incorrectly.
+
+## Testing
+
+Run the automated tests with:
+
+```bash
+python -m unittest discover -s tests
+```

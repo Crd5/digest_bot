@@ -9,6 +9,17 @@ VENV_PYTHON="$PROJECT_DIR/venv/bin/python"
 USER=$(whoami)
 SERVICE_NAME="tg-digest-bot"
 
+systemd_quote() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//%/%%}"
+    printf '"%s"' "$value"
+}
+
+SYSTEMD_PROJECT_DIR=$(systemd_quote "$PROJECT_DIR")
+SYSTEMD_VENV_PYTHON=$(systemd_quote "$VENV_PYTHON")
+
 echo "--- Telegram Digest Bot Service Setup ---"
 
 # Check if venv exists
@@ -40,8 +51,8 @@ After=network.target
 [Service]
 Type=simple
 User=$USER
-WorkingDirectory=$PROJECT_DIR
-ExecStart=$VENV_PYTHON main.py
+WorkingDirectory=$SYSTEMD_PROJECT_DIR
+ExecStart=$SYSTEMD_VENV_PYTHON main.py
 Restart=always
 RestartSec=10
 StandardOutput=syslog
