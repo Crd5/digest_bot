@@ -37,6 +37,18 @@ A Telegram user bot that uses Telethon and the Google Gemini API to analyze sele
      - `API_HASH`: Your Telegram API Hash.
      - `GEMINI_API_KEY`: Your Google Gemini API Key.
 
+### Linux Service Setup (Optional)
+
+If you are running the bot on a Linux server, you can set it up as a `systemd` service using the provided script:
+
+1. **Generate the service file:**
+   ```bash
+   ./setup_service.sh
+   ```
+2. **Follow the on-screen instructions** to copy the generated `.service` file to `/etc/systemd/system/` and start it.
+
+*Note: Ensure you have run the bot manually at least once to complete the Telegram authentication before starting the service.*
+
 ## Usage
 
 1. **Start the bot:**
