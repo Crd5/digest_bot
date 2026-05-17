@@ -2,6 +2,7 @@ import os
 import asyncio
 from datetime import datetime, timezone
 import logging
+from typing import Dict, NamedTuple, Optional
 
 from telethon import TelegramClient, events
 from google import genai
@@ -29,88 +30,138 @@ if not all([API_ID, API_HASH, GEMINI_API_KEY]):
 client = TelegramClient('digest_session', int(API_ID), API_HASH)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 database.init_db()
+digest_lock = None  # type: Optional[asyncio.Lock]
+
+
+class DigestResult(NamedTuple):
+    text: str
+    cursor_updates: Dict[int, int]
+
+
+def get_digest_lock() -> asyncio.Lock:
+    global digest_lock
+    if digest_lock is None:
+        digest_lock = asyncio.Lock()
+    return digest_lock
+
+
+async def resolve_chat_entity(chat_identifier: str):
+    try:
+        return await client.get_entity(chat_identifier)
+    except ValueError:
+        return await client.get_entity(int(chat_identifier))
+
 
 async def generate_digest_summary(chat_title: str, text_content: str) -> str:
     if not text_content.strip():
         return ""
-    
+
     prompt = (
         f"You are an expert assistant. Summarize the key discussions, announcements, and highlights "
         f"specifically for the Telegram chat: '{chat_title}'.\n\n"
         "Please provide a clear, concise summary using Markdown. Focus on the most important information.\n\n"
         f"Messages:\n{text_content}"
     )
-    
+
+    # Note: Using gemini-2.5-pro as it's the current recommended model for general tasks
+    response = await gemini_client.aio.models.generate_content(
+        model='gemini-2.5-pro',
+        contents=prompt,
+    )
+    response_text = (response.text or "").strip()
+    return f"### {chat_title}\n{response_text}"
+
+
+async def summarize_chat(chat_id: int, chat_title: str, text_content: str):
     try:
-        # Note: Using gemini-2.5-pro as it's the current recommended model for general tasks
-        response = gemini_client.models.generate_content(
-            model='gemini-2.5-pro',
-            contents=prompt,
-        )
-        return f"### {chat_title}\n{response.text.strip()}"
+        summary = await generate_digest_summary(chat_title, text_content)
+        return chat_id, summary, True
     except Exception as e:
         logger.error(f"Error generating summary for {chat_title}: {e}")
-        return f"### {chat_title}\nError: Could not generate summary due to an API error."
+        return chat_id, f"### {chat_title}\nError: Could not generate summary due to an API error.", False
 
-async def fetch_messages_and_digest():
+
+def commit_cursor_updates(cursor_updates: Dict[int, int]) -> None:
+    for chat_id, timestamp in cursor_updates.items():
+        database.update_chat_last_digest_timestamp(chat_id, timestamp)
+
+
+async def build_digest_result() -> DigestResult:
     logger.info("Starting digest generation...")
     target_chats = database.get_target_chats()
     if not target_chats:
         logger.info("No target chats configured.")
-        return "No target chats configured. Add some using `/add <chat>`."
+        return DigestResult("No target chats configured. Add some using `/add <chat>`.", {})
 
-    last_run = database.get_last_run_timestamp()
-    last_run_dt = datetime.fromtimestamp(last_run, tz=timezone.utc) if last_run > 0 else None
-    
+    run_started_timestamp = int(datetime.now(timezone.utc).timestamp())
     summary_tasks = []
-    has_new_messages = False
-    
+    cursor_updates = {}
+
     for chat_info in target_chats:
         chat_id = chat_info['chat_id']
         chat_title = chat_info['chat_title']
+        last_run = chat_info.get('last_digest_timestamp', 0) or 0
+        last_run_dt = datetime.fromtimestamp(last_run, tz=timezone.utc) if last_run > 0 else None
         chat_messages = []
-        
+
         try:
             limit = None if last_run > 0 else 100
             async for message in client.iter_messages(chat_id, limit=limit):
                 if last_run_dt and message.date and message.date <= last_run_dt:
                     break
-                
+
                 if message.text:
                     sender = await message.get_sender()
-                    sender_name = sender.username or sender.first_name or "Unknown" if sender else "Unknown"
+                    sender_name = (
+                        getattr(sender, 'username', None)
+                        or getattr(sender, 'first_name', None)
+                        or getattr(sender, 'title', None)
+                        or "Unknown"
+                    )
                     msg_time = message.date.strftime("%Y-%m-%d %H:%M:%S")
                     chat_messages.append(f"[{msg_time}] {sender_name}: {message.text}")
-                    
+            cursor_updates[chat_id] = run_started_timestamp
         except Exception as e:
             logger.error(f"Error fetching from {chat_title} ({chat_id}): {e}")
+            continue
 
         if chat_messages:
-            has_new_messages = True
             chat_messages.reverse() # chronological
             compiled_chat_text = "\n".join(chat_messages)
-            summary_tasks.append(generate_digest_summary(chat_title, compiled_chat_text))
+            summary_tasks.append(summarize_chat(chat_id, chat_title, compiled_chat_text))
 
-    if not has_new_messages:
+    if not summary_tasks:
         logger.info("No new messages found.")
-        database.update_last_run_timestamp(int(datetime.now(timezone.utc).timestamp()))
-        return "No new messages in the tracked chats since the last digest."
-    
-    # Generate summaries in parallel
-    individual_summaries = await asyncio.gather(*summary_tasks)
-    
-    # Filter out empty results and join
-    full_summary = "\n\n".join([s for s in individual_summaries if s])
-    
-    # Update state
-    database.update_last_run_timestamp(int(datetime.now(timezone.utc).timestamp()))
-    
-    logger.info("Digest generation complete.")
-    return f"**Daily Digest**\n\n{full_summary}"
+        return DigestResult("No new messages in the tracked chats since the last digest.", cursor_updates)
 
-async def send_digest():
-    summary_text = await fetch_messages_and_digest()
-    await client.send_message('me', summary_text)
+    # Generate summaries in parallel
+    summary_results = await asyncio.gather(*summary_tasks)
+
+    failed_summary_chat_ids = {chat_id for chat_id, _, success in summary_results if not success}
+    for chat_id in failed_summary_chat_ids:
+        cursor_updates.pop(chat_id, None)
+
+    # Filter out empty results and join
+    individual_summaries = [summary for _, summary, _ in summary_results]
+    full_summary = "\n\n".join([s for s in individual_summaries if s])
+
+    logger.info("Digest generation complete.")
+    return DigestResult(f"**Daily Digest**\n\n{full_summary}", cursor_updates)
+
+
+async def fetch_messages_and_digest(advance_cursors: bool = False):
+    result = await build_digest_result()
+    if advance_cursors:
+        commit_cursor_updates(result.cursor_updates)
+    return result.text
+
+
+async def send_digest(advance_cursors: bool = True):
+    async with get_digest_lock():
+        result = await build_digest_result()
+        await client.send_message('me', result.text)
+        if advance_cursors:
+            commit_cursor_updates(result.cursor_updates)
 
 # Event Handlers for commands in Saved Messages (peer 'me')
 @events.register(events.NewMessage(chats='me', pattern=r'^/add\s+(.+)'))
@@ -118,10 +169,11 @@ async def add_command_handler(event):
     chat_identifier = event.pattern_match.group(1).strip()
     try:
         # Try to resolve entity
-        entity = await client.get_entity(chat_identifier)
+        entity = await resolve_chat_entity(chat_identifier)
         title = getattr(entity, 'title', getattr(entity, 'username', 'Unknown Chat'))
-        database.add_target_chat(entity.id, title)
-        status = await event.respond(f"Added '{title}' (ID: {entity.id}) to digest targets.")
+        chat_id = await client.get_peer_id(entity)
+        database.add_target_chat(chat_id, title)
+        status = await event.respond(f"Added '{title}' (ID: {chat_id}) to digest targets.")
     except Exception as e:
         status = await event.respond(f"Could not add chat: {e}")
     
@@ -136,8 +188,8 @@ async def remove_command_handler(event):
     try:
         # Try to resolve entity to get ID
         try:
-            entity = await client.get_entity(chat_identifier)
-            chat_id = entity.id
+            entity = await resolve_chat_entity(chat_identifier)
+            chat_id = await client.get_peer_id(entity)
         except ValueError:
             # If it's just an ID
             chat_id = int(chat_identifier)
@@ -170,9 +222,8 @@ async def list_command_handler(event):
 @events.register(events.NewMessage(chats='me', pattern=r'^/digest'))
 async def digest_command_handler(event):
     status = await event.respond("Generating digest, please wait...")
-    
-    summary_text = await fetch_messages_and_digest()
-    await client.send_message('me', summary_text)
+
+    await send_digest(advance_cursors=False)
     
     # Auto-cleanup command and status
     await event.delete()

@@ -64,6 +64,6 @@ If you are running the bot on a Linux server, you can set it up as a `systemd` s
    - `/add <chat_username_or_id>`: Add a chat or channel to the digest targets (e.g., `/add @durov` or `/add -100123456789`).
    - `/remove <chat_username_or_id>`: Remove a chat or channel from the targets.
    - `/list`: List all currently tracked chats.
-   - `/digest`: Manually trigger the generation of a digest for the messages received since the last run.
+   - `/digest`: Preview a digest for messages received since the last scheduled digest. This does not affect the evening scheduled digest.
 
-The bot will also automatically generate and send a digest to your Saved Messages every day at 22:00 UTC+3.
+The bot will also automatically generate and send a digest to your Saved Messages every day at 22:00 UTC+3. Each tracked chat keeps its own cursor, so a temporary failure in one chat does not advance the others incorrectly.
