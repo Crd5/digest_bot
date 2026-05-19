@@ -1,82 +1,85 @@
 # Telegram Digest Bot
 
-A Telegram user bot that uses Telethon and the Google Gemini API to analyze selected chats and channels and generate daily highlights.
+A Telegram user bot that summarizes selected chats and channels into daily highlights using Telethon and Google Gemini.
+
+The bot runs from your Telegram account, listens for commands in Saved Messages, and sends digest output back to Saved Messages.
 
 ## Features
 
-- **Daily Highlights:** Summarizes the activity in your tracked chats using Google Gemini.
-- **Scheduled Digests:** Automatically generates a digest every day at 22:00 UTC+3.
-- **On-Demand Digests:** Can be triggered manually at any time via a command.
-- **Dynamic Configuration:** Manage the list of tracked chats directly from Telegram.
-- **Self-Cleaning:** Automatically deletes command messages and temporary status updates to keep your "Saved Messages" tidy.
+- Daily scheduled digest at `22:00 UTC+3`.
+- Manual `/digest` preview on demand.
+- Dynamic tracked-chat management from Telegram.
+- Per-chat cursors so one failing chat does not corrupt the others.
+- Plain-text Telegram output for safer handling of AI-generated and user-controlled content.
+- Local SQLite state with private file permission hardening.
 
-## Privacy and Security
+## Privacy And Security
 
 Tracked Telegram message text, sender names, and chat titles are sent to the Google Gemini API for summarization. Only add chats whose contents you are comfortable processing with an external AI service.
 
-Keep `.env` and `*.session` files private. They contain credentials or Telegram login state, so restrict them to your user account:
+Keep `.env`, `*.session*`, and `*.db*` files private. They contain credentials, Telegram login state, or local chat tracking state.
 
 ```bash
-chmod 600 .env *.session 2>/dev/null || true
+chmod 600 .env *.session digest_bot.db* 2>/dev/null || true
 ```
 
-## Prerequisites
+## Requirements
 
-- Python 3.9 or higher.
-- A Telegram API ID and API Hash (obtain from [https://my.telegram.org/](https://my.telegram.org/)).
-- A Google Gemini API Key.
+- Python 3.9 or newer.
+- Telegram API ID and API hash from https://my.telegram.org/.
+- Google Gemini API key.
 
-## Setup
+## Quickstart
 
-1. **Clone the repository and enter the directory.**
+Create a virtual environment and install dependencies:
 
-2. **Create a virtual environment and install dependencies:**
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-3. **Configure Environment Variables:**
-   - Copy the example environment file:
-     ```bash
-     cp .env.example .env
-     ```
-   - Open `.env` and fill in your credentials:
-     - `API_ID`: Your Telegram API ID.
-     - `API_HASH`: Your Telegram API Hash.
-     - `GEMINI_API_KEY`: Your Google Gemini API Key.
+Create `.env`:
 
-### Linux Service Setup (Optional)
+```bash
+cp .env.example .env
+```
 
-If you are running the bot on a Linux server, you can set it up as a `systemd` service using the provided script:
+Fill in:
 
-1. **Generate the service file:**
-   ```bash
-   ./setup_service.sh
-   ```
-2. **Follow the on-screen instructions** to copy the generated `.service` file to `/etc/systemd/system/` and start it.
+```text
+API_ID=your_api_id
+API_HASH=your_api_hash
+GEMINI_API_KEY=your_gemini_api_key
+```
 
-*Note: Ensure you have run the bot manually at least once to complete the Telegram authentication before starting the service.*
+Run the bot:
 
-## Usage
+```bash
+source venv/bin/activate
+python main.py
+```
 
-1. **Start the bot:**
-   ```bash
-   source venv/bin/activate
-   python main.py
-   ```
-   *Note: On the first run, Telethon will ask you to enter your phone number and the login code sent to your Telegram app to authenticate the session. This will create a `digest_session.session` file locally.*
+On first run, Telethon asks for Telegram login details and creates `digest_session.session` locally.
 
-2. **Interact with the bot:**
-   Send the following commands directly to your **Saved Messages** in Telegram:
+## Telegram Commands
 
-   - `/add <chat_username_or_id>`: Add a chat or channel to the digest targets (e.g., `/add @durov` or `/add -100123456789`). Tracking starts from the latest message visible at add time; older history is not backfilled.
-   - `/remove <chat_username_or_id>`: Remove a chat or channel from the targets.
-   - `/list`: List all currently tracked chats.
-   - `/digest`: Preview a digest for messages received since the last scheduled digest. This does not affect the evening scheduled digest.
+Send commands to your Saved Messages:
 
-The bot will also automatically generate and send a digest to your Saved Messages every day at 22:00 UTC+3. Each tracked chat keeps its own cursor, so a temporary failure in one chat does not advance the others incorrectly.
+- `/add <chat_username_or_id>`: add a chat or channel. Tracking starts from the latest visible message at add time; older history is not backfilled.
+- `/remove <chat_username_or_id>`: remove a tracked chat or channel.
+- `/list`: list tracked chats.
+- `/digest`: preview a digest without advancing scheduled digest cursors.
+
+## Linux Service
+
+After completing first-run Telegram authentication, generate a `systemd` service file:
+
+```bash
+./setup_service.sh
+```
+
+Then follow the script output to install and start the service.
 
 ## Testing
 
@@ -85,3 +88,11 @@ Run the automated tests with:
 ```bash
 venv/bin/python -m unittest discover -s tests
 ```
+
+## Developer Docs
+
+- [Docs index](docs/index.md)
+- [Development guide](docs/development.md)
+- [Architecture guide](docs/architecture.md)
+- [Operations guide](docs/operations.md)
+- [Future-agent notes](docs/agent-notes.md)
