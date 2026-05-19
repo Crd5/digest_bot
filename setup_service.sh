@@ -17,6 +17,17 @@ systemd_quote() {
     printf '"%s"' "$value"
 }
 
+secure_private_file() {
+    local file_path="$1"
+    if [ -f "$file_path" ]; then
+        if chmod 600 "$file_path"; then
+            echo "Restricted permissions on $file_path."
+        else
+            echo "Warning: Could not restrict permissions on $file_path."
+        fi
+    fi
+}
+
 SYSTEMD_PROJECT_DIR=$(systemd_quote "$PROJECT_DIR")
 SYSTEMD_VENV_PYTHON=$(systemd_quote "$VENV_PYTHON")
 
@@ -33,15 +44,25 @@ fi
 if [ ! -f "$PROJECT_DIR/.env" ]; then
     echo "Warning: .env file not found in $PROJECT_DIR."
     echo "Ensure you have configured your API keys before starting the service."
+else
+    secure_private_file "$PROJECT_DIR/.env"
 fi
 
-# Check if session file exists (Telethon needs interactive login once)
-SESSION_FILE=$(ls "$PROJECT_DIR"/*.session 2>/dev/null | head -n 1)
-if [ -z "$SESSION_FILE" ]; then
-    echo "Warning: No .session file found."
+# Check if the exact Telethon session file exists (Telethon needs interactive login once)
+SESSION_FILE="$PROJECT_DIR/digest_session.session"
+if [ ! -f "$SESSION_FILE" ]; then
+    echo "Warning: digest_session.session file not found."
     echo "It is highly recommended to run 'python main.py' manually once to authenticate"
     echo "before starting the systemd service, as the service is non-interactive."
+else
+    secure_private_file "$SESSION_FILE"
 fi
+
+for SESSION_CANDIDATE in "$PROJECT_DIR"/*.session; do
+    [ -e "$SESSION_CANDIDATE" ] || continue
+    [ "$SESSION_CANDIDATE" = "$SESSION_FILE" ] && continue
+    secure_private_file "$SESSION_CANDIDATE"
+done
 
 # Generate the service file content
 SERVICE_FILE_CONTENT="[Unit]
@@ -53,6 +74,7 @@ Type=simple
 User=$USER
 WorkingDirectory=$SYSTEMD_PROJECT_DIR
 ExecStart=$SYSTEMD_VENV_PYTHON main.py
+UMask=0077
 Restart=always
 RestartSec=10
 StandardOutput=syslog

@@ -10,6 +10,16 @@ A Telegram user bot that uses Telethon and the Google Gemini API to analyze sele
 - **Dynamic Configuration:** Manage the list of tracked chats directly from Telegram.
 - **Self-Cleaning:** Automatically deletes command messages and temporary status updates to keep your "Saved Messages" tidy.
 
+## Privacy and Security
+
+Tracked Telegram message text, sender names, and chat titles are sent to the Google Gemini API for summarization. Only add chats whose contents you are comfortable processing with an external AI service.
+
+Keep `.env` and `*.session` files private. They contain credentials or Telegram login state, so restrict them to your user account:
+
+```bash
+chmod 600 .env *.session 2>/dev/null || true
+```
+
 ## Prerequisites
 
 - Python 3.9 or higher.
@@ -61,7 +71,7 @@ If you are running the bot on a Linux server, you can set it up as a `systemd` s
 2. **Interact with the bot:**
    Send the following commands directly to your **Saved Messages** in Telegram:
 
-   - `/add <chat_username_or_id>`: Add a chat or channel to the digest targets (e.g., `/add @durov` or `/add -100123456789`).
+   - `/add <chat_username_or_id>`: Add a chat or channel to the digest targets (e.g., `/add @durov` or `/add -100123456789`). Tracking starts from the latest message visible at add time; older history is not backfilled.
    - `/remove <chat_username_or_id>`: Remove a chat or channel from the targets.
    - `/list`: List all currently tracked chats.
    - `/digest`: Preview a digest for messages received since the last scheduled digest. This does not affect the evening scheduled digest.
