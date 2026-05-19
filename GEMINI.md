@@ -1,70 +1,66 @@
-# Telegram Digest Bot - Project Instructions
+# Telegram Digest Bot - Agent Instructions
+
+This file is the short handoff for future agents. For deeper context, read `docs/index.md` and especially `docs/agent-notes.md`.
 
 ## Project Overview
-A Telegram user bot that leverages **Telethon** and the **Google Gemini API** to analyze messages from selected chats and channels and generate concise daily highlights (digests). It operates primarily within the user's "Saved Messages" chat.
 
-### Core Technologies
-- **Python 3.9+**: Language.
-- **Telethon**: Telegram MTProto API client (User Bot).
-- **google-genai**: Official Google Gemini Python SDK.
-- **SQLite**: Local persistence for tracked chats and run state.
-- **APScheduler**: Scheduling the daily digest generation.
-- **python-dotenv**: Configuration management via `.env`.
+The project is a Telegram user bot that uses Telethon and Google Gemini to summarize selected chats and channels into daily digests. It operates through the user's Saved Messages.
 
-### Architecture
-- `main.py`: Entry point. Initializes the Telegram client, Gemini client, and database. Sets up event handlers for commands and a background scheduler for automated digests.
-- `database.py`: Handles SQLite interactions for managing the list of target chats and tracking the timestamp of the last successful run.
-- `digest_session.session`: (Generated) Telethon session file for authentication.
-- `digest_bot.db`: (Generated) SQLite database file.
+## Start Here
 
----
+1. `README.md`: human quickstart and command reference.
+2. `docs/index.md`: documentation map.
+3. `docs/development.md`: setup and verification workflow.
+4. `docs/architecture.md`: digest, cursor, Gemini, Telegram, and database behavior.
+5. `docs/operations.md`: first-run auth, service setup, private files, and troubleshooting.
+6. `docs/agent-notes.md`: invariants and high-risk areas.
 
-## Building and Running
+## Code Map
 
-### Setup
-1. **Initialize Virtual Environment:**
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
-2. **Configuration:**
-   - Ensure `.env` exists with `API_ID`, `API_HASH`, and `GEMINI_API_KEY`.
-   - See `.env.example` for reference.
+- `main.py`: async runtime, Telegram command handlers, digest generation, Gemini calls, Telegram sending, cursor commits.
+- `database.py`: SQLite schema, migrations, tracked chats, per-chat cursor persistence.
+- `setup_service.sh`: `systemd` service generation and permission hardening for private local files.
+- `tests/test_digest_behavior.py`: behavior, safety, service setup, repo hygiene, and database tests.
 
-### Execution
-- **Start the Bot:**
-  ```bash
-  python main.py
-  ```
-- **Manual Verification:** Use the `/digest` command in your Telegram "Saved Messages" to trigger an immediate digest generation.
+## Core Technologies
 
-### Testing
-- Run the test suite with:
-  ```bash
-  venv/bin/python -m unittest discover -s tests
-  ```
+- Python 3.9+
+- Telethon
+- google-genai
+- SQLite
+- APScheduler
+- python-dotenv
 
----
+## Hard Invariants
 
-## Development Conventions
+- Manual `/digest` previews must not advance cursors.
+- Scheduled digest sends advance cursors only after every Telegram message part sends successfully.
+- Failed fetches and failed or empty summaries must not advance affected chat cursors.
+- Per-chat cursor state must remain independent.
+- Message ID cursors protect same-second Telegram messages from being skipped.
+- Newly added chats start tracking from the latest visible message at add time.
+- User-controlled or AI-generated Telegram output should use `parse_mode=None`.
+- Prompt construction must treat Telegram titles and messages as untrusted data.
+- `.env`, `*.session*`, `*.db*`, SQLite sidecars, logs, and generated service files are private local artifacts.
 
-### Coding Style
-- **Asynchronous Logic:** Use `async/await` throughout, adhering to Telethon's event-driven architecture.
-- **Error Handling:** Log errors using the `logging` module. Provide user-friendly feedback for Telegram command failures.
-- **Self-Cleaning UI:** Command messages and temporary status responses in Telegram should be deleted after a short delay (using `asyncio.sleep` and `event.delete()`) to keep the "Saved Messages" clean.
+## Build And Run
 
-### Prompt Engineering
-- The digest prompt is located in the `generate_digest_summary` function in `main.py`.
-- It currently instructs Gemini to group summaries by "Chat Title" and use Markdown formatting.
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+python main.py
+```
 
-### Database Updates
-- When modifying the schema in `database.py`, ensure the `init_db()` function handles migrations or provides instructions for existing users (currently, it only uses `CREATE TABLE IF NOT EXISTS`).
+`python main.py` requires valid `.env` credentials. The first run creates a Telethon session file after interactive Telegram login.
 
----
+## Test
 
-## Command Reference (Telegram "Saved Messages")
-- `/add <chat>`: Add a chat (username or ID) to the track list.
-- `/remove <chat>`: Remove a chat from the track list.
-- `/list`: List all tracked chats.
-- `/digest`: Trigger a manual digest since the last run.
+Run the full suite with:
+
+```bash
+venv/bin/python -m unittest discover -s tests
+```
+
+Run this after behavior changes and after edits to `README.md` or `GEMINI.md`, because repo hygiene tests inspect those files.
