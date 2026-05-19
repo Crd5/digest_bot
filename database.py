@@ -104,7 +104,11 @@ def update_chat_last_digest_timestamp(chat_id, timestamp, message_id=None):
         cursor = conn.cursor()
         if message_id is None:
             cursor.execute(
-                'UPDATE target_chats SET last_digest_timestamp = ? WHERE chat_id = ?',
+                '''
+                UPDATE target_chats
+                SET last_digest_timestamp = ?, last_digest_message_id = 0
+                WHERE chat_id = ?
+                ''',
                 (timestamp, chat_id),
             )
         else:

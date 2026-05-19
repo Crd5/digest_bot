@@ -3,6 +3,7 @@ import asyncio
 import json
 from datetime import datetime, timezone
 import logging
+from pathlib import Path
 from typing import Dict, NamedTuple, Optional
 
 from telethon import TelegramClient, events
@@ -21,6 +22,8 @@ MAX_TELEGRAM_MESSAGE_LENGTH = 4096
 MAX_CONCURRENT_SUMMARIES = 3
 TRUNCATION_MARKER = "... [truncated]"
 INITIAL_FETCH_LIMIT = 100
+PRIVATE_FILE_MODE = 0o600
+PRIVATE_FILE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 ADD_COMMAND_PATTERN = r'^/add\s+(.+)'
 REMOVE_COMMAND_PATTERN = r'^/remove\s+(.+)'
 LIST_COMMAND_PATTERN = r'^/list\s*$'
@@ -53,10 +56,44 @@ def get_digest_lock() -> asyncio.Lock:
     return digest_lock
 
 
+def private_file_sidecars(file_path: Path) -> list[Path]:
+    return [Path(f"{file_path}{suffix}") for suffix in PRIVATE_FILE_SIDECAR_SUFFIXES]
+
+
+def local_private_file_paths() -> list[Path]:
+    paths = [
+        path
+        for path in Path(".").glob(".env*")
+        if path.name != ".env.example"
+    ]
+    paths.extend(Path(".").glob("*.session*"))
+
+    db_path = Path(database.DB_FILE)
+    paths.append(db_path)
+    paths.extend(private_file_sidecars(db_path))
+    return paths
+
+
+def restrict_private_file_permissions(file_paths) -> None:
+    for file_path in file_paths:
+        try:
+            path = Path(file_path)
+            if path.is_file():
+                path.chmod(PRIVATE_FILE_MODE)
+        except OSError as e:
+            logger.warning(f"Could not restrict permissions on {file_path}: {e}")
+
+
+def restrict_local_private_files() -> None:
+    restrict_private_file_permissions(local_private_file_paths())
+
+
 def initialize_runtime() -> None:
     global client, gemini_client
 
+    os.umask(0o077)
     load_dotenv()
+    restrict_local_private_files()
     api_id = os.getenv('API_ID')
     api_hash = os.getenv('API_HASH')
     gemini_api_key = os.getenv('GEMINI_API_KEY')
@@ -72,6 +109,7 @@ def initialize_runtime() -> None:
     client = TelegramClient('digest_session', api_id_int, api_hash)
     gemini_client = genai.Client(api_key=gemini_api_key)
     database.init_db()
+    restrict_local_private_files()
 
 
 def get_telegram_client() -> TelegramClient:
@@ -393,7 +431,7 @@ async def send_digest(advance_cursors: bool = True):
     async with get_digest_lock():
         result = await build_digest_result()
         for message_part in split_telegram_message(result.text, MAX_TELEGRAM_MESSAGE_LENGTH):
-            await get_telegram_client().send_message('me', message_part)
+            await get_telegram_client().send_message('me', message_part, parse_mode=None)
         if advance_cursors:
             commit_cursor_updates(result.cursor_updates)
 
@@ -414,6 +452,10 @@ async def cleanup_messages(delay_seconds: int, *messages) -> None:
         await safe_delete(message)
 
 
+async def respond_plain(event, message: str):
+    return await event.respond(message, parse_mode=None)
+
+
 # Event Handlers for commands in Saved Messages (peer 'me')
 @events.register(events.NewMessage(chats='me', pattern=ADD_COMMAND_PATTERN))
 async def add_command_handler(event):
@@ -427,9 +469,9 @@ async def add_command_handler(event):
         start_message_id = await get_latest_message_id(chat_id)
         start_timestamp = int(datetime.now(timezone.utc).timestamp())
         database.add_target_chat(chat_id, title, start_timestamp, start_message_id)
-        status = await event.respond(f"Added '{title}' (ID: {chat_id}) to digest targets.")
+        status = await respond_plain(event, f"Added '{title}' (ID: {chat_id}) to digest targets.")
     except Exception as e:
-        status = await event.respond(f"Could not add chat: {e}")
+        status = await respond_plain(event, f"Could not add chat: {e}")
     finally:
         await cleanup_messages(5, event, status)
 
@@ -447,9 +489,9 @@ async def remove_command_handler(event):
             chat_id = int(chat_identifier)
             
         database.remove_target_chat(chat_id)
-        status = await event.respond(f"Removed chat ID {chat_id} from targets.")
+        status = await respond_plain(event, f"Removed chat ID {chat_id} from targets.")
     except Exception as e:
-        status = await event.respond(f"Could not remove chat: {e}")
+        status = await respond_plain(event, f"Could not remove chat: {e}")
     finally:
         await cleanup_messages(5, event, status)
 
@@ -464,20 +506,20 @@ async def list_command_handler(event):
     statuses = []
     try:
         for message_part in split_telegram_message(msg, MAX_TELEGRAM_MESSAGE_LENGTH):
-            statuses.append(await event.respond(message_part))
+            statuses.append(await respond_plain(event, message_part))
     finally:
         await cleanup_messages(10, event, *statuses)
 
 @events.register(events.NewMessage(chats='me', pattern=DIGEST_COMMAND_PATTERN))
 async def digest_command_handler(event):
-    status = await event.respond("Generating digest, please wait...")
+    status = await respond_plain(event, "Generating digest, please wait...")
     error_status = None
 
     try:
         await send_digest(advance_cursors=False)
     except Exception as e:
         logger.error(f"Error generating manual digest: {e}")
-        error_status = await event.respond("Could not generate digest. Check the bot logs for details.")
+        error_status = await respond_plain(event, "Could not generate digest. Check the bot logs for details.")
         await cleanup_messages(10, error_status)
     finally:
         await cleanup_messages(0, event, status)
@@ -487,6 +529,7 @@ async def main():
     initialize_runtime()
     telegram_client = get_telegram_client()
     await telegram_client.start()
+    restrict_local_private_files()
     
     # Register handlers
     telegram_client.add_event_handler(add_command_handler)

@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,7 @@ class FakeClient:
     def __init__(self, messages_by_chat=None, *, send_error=None, fail_after=None):
         self.messages_by_chat = messages_by_chat or {}
         self.sent_messages = []
+        self.sent_message_options = []
         self.send_error = send_error
         self.fail_after = fail_after
 
@@ -60,12 +62,13 @@ class FakeClient:
         for message in messages:
             yield message
 
-    async def send_message(self, peer, text):
+    async def send_message(self, peer, text, **kwargs):
         if self.fail_after is not None and len(self.sent_messages) >= self.fail_after:
             raise RuntimeError("send failed")
         if self.send_error:
             raise self.send_error
         self.sent_messages.append((peer, text))
+        self.sent_message_options.append(kwargs)
 
 
 class FakeDatabase:
@@ -141,6 +144,20 @@ class DigestBehaviorTests(unittest.IsolatedAsyncioTestCase):
         sent_texts = [text for _, text in self.main.client.sent_messages]
         self.assertEqual(["A" * 50, "A" * 50, "A" * 20], sent_texts)
         self.assertEqual({-1001: 456}, fake_db.updated)
+
+    async def test_scheduled_digest_sends_plain_text_without_markdown_parsing(self):
+        fake_db = FakeDatabase()
+        self.main.database = fake_db
+        self.main.client = FakeClient()
+
+        async def fake_digest_result():
+            return self.main.DigestResult("[click me](tg://user?id=1)\n**spoof**", {})
+
+        self.main.build_digest_result = fake_digest_result
+
+        await self.main.send_digest(advance_cursors=True)
+
+        self.assertEqual([{"parse_mode": None}], self.main.client.sent_message_options)
 
     async def test_scheduled_digest_does_not_advance_cursors_when_split_send_fails(self):
         fake_db = FakeDatabase()
@@ -454,7 +471,7 @@ class DigestBehaviorTests(unittest.IsolatedAsyncioTestCase):
         class Event:
             pattern_match = SimpleNamespace(group=lambda index: "@channel")
 
-            async def respond(self, message):
+            async def respond(self, message, **kwargs):
                 self.message = message
                 return Status()
 
@@ -501,7 +518,7 @@ class DigestBehaviorTests(unittest.IsolatedAsyncioTestCase):
         class Event:
             pattern_match = SimpleNamespace(group=lambda index: "-100123")
 
-            async def respond(self, message):
+            async def respond(self, message, **kwargs):
                 self.message = message
                 return Status()
 
@@ -549,7 +566,7 @@ class DigestBehaviorTests(unittest.IsolatedAsyncioTestCase):
         class Event:
             pattern_match = SimpleNamespace(group=lambda index: "@quiet")
 
-            async def respond(self, message):
+            async def respond(self, message, **kwargs):
                 return Status()
 
             async def delete(self):
@@ -586,8 +603,9 @@ class DigestBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 self.statuses = []
                 self.deleted = False
 
-            async def respond(self, message):
+            async def respond(self, message, **kwargs):
                 status = Status(message)
+                status.kwargs = kwargs
                 self.statuses.append(status)
                 return status
 
@@ -601,6 +619,7 @@ class DigestBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(len(event.statuses), 1)
         self.assertTrue(all(len(status.message) <= self.main.MAX_TELEGRAM_MESSAGE_LENGTH for status in event.statuses))
+        self.assertTrue(all(status.kwargs == {"parse_mode": None} for status in event.statuses))
         self.assertTrue(all(status.deleted for status in event.statuses))
         self.assertTrue(event.deleted)
 
@@ -619,7 +638,7 @@ class DigestBehaviorTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self):
                 self.deleted = False
 
-            async def respond(self, message):
+            async def respond(self, message, **kwargs):
                 status = Status(message)
                 statuses.append(status)
                 return status
@@ -666,7 +685,7 @@ class DigestBehaviorTests(unittest.IsolatedAsyncioTestCase):
         class Event:
             pattern_match = SimpleNamespace(group=lambda index: "@channel")
 
-            async def respond(self, message):
+            async def respond(self, message, **kwargs):
                 return Status()
 
             async def delete(self):
@@ -757,24 +776,102 @@ class ImportBehaviorTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "API_ID"):
                 module.initialize_runtime()
 
+    def test_initialize_runtime_restricts_private_files_before_validation_errors(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        module = load_main(temp_dir.name)
+        project_dir = Path(temp_dir.name)
+        env_path = project_dir / ".env"
+        session_path = project_dir / "digest_session.session"
+        env_path.touch()
+        session_path.touch()
+        env_path.chmod(0o644)
+        session_path.chmod(0o644)
+        previous_cwd = os.getcwd()
+
+        try:
+            os.chdir(project_dir)
+            with patch.dict(
+                os.environ,
+                {"API_ID": "not-an-int", "API_HASH": "dummy_hash", "GEMINI_API_KEY": "dummy_key"},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "API_ID"):
+                    module.initialize_runtime()
+        finally:
+            os.chdir(previous_cwd)
+
+        self.assertEqual(0o600, env_path.stat().st_mode & 0o777)
+        self.assertEqual(0o600, session_path.stat().st_mode & 0o777)
+
+    def test_initialize_runtime_restricts_private_file_permissions(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        module = load_main(temp_dir.name)
+        project_dir = Path(temp_dir.name)
+        env_path = project_dir / ".env"
+        session_path = project_dir / "digest_session.session"
+        env_path.touch()
+        session_path.touch()
+        env_path.chmod(0o644)
+        session_path.chmod(0o644)
+        previous_cwd = os.getcwd()
+        previous_umask = os.umask(0o022)
+        os.umask(previous_umask)
+        self.addCleanup(os.umask, previous_umask)
+
+        try:
+            os.chdir(project_dir)
+            with patch.dict(
+                os.environ,
+                {"API_ID": "12345", "API_HASH": "dummy_hash", "GEMINI_API_KEY": "dummy_key"},
+                clear=True,
+            ):
+                with patch.object(module, "TelegramClient", return_value=SimpleNamespace()):
+                    with patch.object(module.genai, "Client", return_value=SimpleNamespace()):
+                        module.initialize_runtime()
+        finally:
+            os.chdir(previous_cwd)
+
+        db_path = project_dir / "digest_bot.db"
+        self.assertEqual(0o600, env_path.stat().st_mode & 0o777)
+        self.assertEqual(0o600, session_path.stat().st_mode & 0o777)
+        self.assertEqual(0o600, db_path.stat().st_mode & 0o777)
+
 
 class ServiceSetupTests(unittest.TestCase):
+    def write_setup_script(self, project_dir):
+        script_path = project_dir / "setup_service.sh"
+        script_path.write_text((PROJECT_ROOT / "setup_service.sh").read_text())
+        script_path.chmod(0o755)
+        return script_path
+
     def test_generated_systemd_unit_escapes_paths(self):
         temp_dir = tempfile.TemporaryDirectory(prefix="digest bot %")
         self.addCleanup(temp_dir.cleanup)
         project_dir = Path(temp_dir.name)
+        script_path = self.write_setup_script(project_dir)
         python_path = project_dir / "venv" / "bin" / "python"
         python_path.parent.mkdir(parents=True)
         python_path.touch()
         env_path = project_dir / ".env"
         session_path = project_dir / "x.session"
+        db_paths = [
+            project_dir / "digest_bot.db",
+            project_dir / "digest_bot.db-wal",
+            project_dir / "digest_bot.db-shm",
+        ]
         env_path.touch()
         session_path.touch()
+        for db_path in db_paths:
+            db_path.touch()
         env_path.chmod(0o644)
         session_path.chmod(0o644)
+        for db_path in db_paths:
+            db_path.chmod(0o644)
 
         result = subprocess.run(
-            [str(PROJECT_ROOT / "setup_service.sh")],
+            [str(script_path)],
             cwd=project_dir,
             check=True,
             capture_output=True,
@@ -790,6 +887,107 @@ class ServiceSetupTests(unittest.TestCase):
         self.assertIn("digest_session.session file not found", result.stdout)
         self.assertEqual(0o600, env_path.stat().st_mode & 0o777)
         self.assertEqual(0o600, session_path.stat().st_mode & 0o777)
+        self.assertTrue(all((db_path.stat().st_mode & 0o777) == 0o600 for db_path in db_paths))
+
+    def test_setup_service_uses_script_directory_when_called_from_elsewhere(self):
+        project_temp_dir = tempfile.TemporaryDirectory(prefix="digest bot %")
+        other_temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(project_temp_dir.cleanup)
+        self.addCleanup(other_temp_dir.cleanup)
+        project_dir = Path(project_temp_dir.name)
+        other_dir = Path(other_temp_dir.name)
+        script_path = self.write_setup_script(project_dir)
+        python_path = project_dir / "venv" / "bin" / "python"
+        python_path.parent.mkdir(parents=True)
+        python_path.touch()
+
+        subprocess.run(
+            [str(script_path)],
+            cwd=other_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        service_path = project_dir / "tg-digest-bot.service"
+        self.assertTrue(service_path.exists())
+        self.assertFalse((other_dir / "tg-digest-bot.service").exists())
+        expected_project_dir = str(project_dir.resolve()).replace("%", "%%")
+        self.assertIn(expected_project_dir, service_path.read_text())
+
+    def test_setup_service_restricts_private_files_before_missing_venv_error(self):
+        temp_dir = tempfile.TemporaryDirectory(prefix="digest bot %")
+        self.addCleanup(temp_dir.cleanup)
+        project_dir = Path(temp_dir.name)
+        script_path = self.write_setup_script(project_dir)
+        private_paths = [
+            project_dir / ".env",
+            project_dir / ".env.local",
+            project_dir / "digest_session.session",
+            project_dir / "digest_session.session-wal",
+            project_dir / "digest_bot.db",
+            project_dir / "digest_bot.db-wal",
+        ]
+        for path in private_paths:
+            path.touch()
+            path.chmod(0o644)
+
+        result = subprocess.run(
+            [str(script_path)],
+            cwd=project_dir,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("Virtual environment not found", result.stdout)
+        self.assertTrue(all((path.stat().st_mode & 0o777) == 0o600 for path in private_paths))
+
+
+class RepoHygieneTests(unittest.TestCase):
+    def test_gitignore_excludes_sensitive_sidecars(self):
+        candidates = [
+            "digest_bot.db",
+            "digest_bot.db-journal",
+            "digest_bot.db-wal",
+            "digest_bot.db-shm",
+            "digest_session.session",
+            "digest_session.session-journal",
+            "digest_session.session-wal",
+            "digest_session.session-shm",
+            ".env",
+            ".env.local",
+        ]
+
+        result = subprocess.run(
+            ["git", "check-ignore", "-v", *candidates],
+            cwd=PROJECT_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        ignored = {line.rsplit(maxsplit=1)[-1] for line in result.stdout.splitlines()}
+        self.assertEqual(set(candidates), ignored)
+
+    def test_project_instruction_file_is_trackable(self):
+        result = subprocess.run(
+            ["git", "check-ignore", "-v", "GEMINI.md"],
+            cwd=PROJECT_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertEqual("", result.stdout)
+
+    def test_docs_include_venv_safe_test_command(self):
+        expected_command = "venv/bin/python -m unittest discover -s tests"
+
+        self.assertIn(expected_command, (PROJECT_ROOT / "README.md").read_text())
+        self.assertIn(expected_command, (PROJECT_ROOT / "GEMINI.md").read_text())
 
 
 class DatabaseTests(unittest.TestCase):
@@ -818,6 +1016,54 @@ class DatabaseTests(unittest.TestCase):
                 "last_digest_message_id": 101,
             }],
             chats,
+        )
+
+    def test_timestamp_only_cursor_update_clears_message_id_cursor(self):
+        self.database.add_target_chat(-100123, "Original", last_digest_timestamp=123, last_digest_message_id=99)
+
+        self.database.update_chat_last_digest_timestamp(-100123, 456)
+
+        chats = self.database.get_target_chats()
+        self.assertEqual(456, chats[0]["last_digest_timestamp"])
+        self.assertEqual(0, chats[0]["last_digest_message_id"])
+
+    def test_init_db_migrates_old_global_cursor_schema(self):
+        db_path = Path(self.database.DB_FILE)
+        db_path.unlink()
+        conn = sqlite3.connect(db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE target_chats (
+                    chat_id INTEGER PRIMARY KEY,
+                    chat_title TEXT
+                )
+            ''')
+            cursor.execute(
+                'INSERT INTO target_chats (chat_id, chat_title) VALUES (?, ?)',
+                (-100123, "Legacy Chat"),
+            )
+            cursor.execute('''
+                CREATE TABLE state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    last_run_timestamp INTEGER
+                )
+            ''')
+            cursor.execute('INSERT INTO state (id, last_run_timestamp) VALUES (1, 789)')
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.database.init_db()
+
+        self.assertEqual(
+            [{
+                "chat_id": -100123,
+                "chat_title": "Legacy Chat",
+                "last_digest_timestamp": 789,
+                "last_digest_message_id": 0,
+            }],
+            self.database.get_target_chats(),
         )
 
 

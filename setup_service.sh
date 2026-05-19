@@ -4,7 +4,8 @@
 # This script generates a systemd service file for the bot.
 
 # Get the absolute path of the project directory
-PROJECT_DIR=$(pwd)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
+PROJECT_DIR="$SCRIPT_DIR"
 VENV_PYTHON="$PROJECT_DIR/venv/bin/python"
 USER=$(whoami)
 SERVICE_NAME="tg-digest-bot"
@@ -33,20 +34,19 @@ SYSTEMD_VENV_PYTHON=$(systemd_quote "$VENV_PYTHON")
 
 echo "--- Telegram Digest Bot Service Setup ---"
 
-# Check if venv exists
-if [ ! -f "$VENV_PYTHON" ]; then
-    echo "Error: Virtual environment not found at $PROJECT_DIR/venv"
-    echo "Please create it first: python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt"
-    exit 1
-fi
-
-# Check if .env exists
+# Restrict local secrets before any early exit.
 if [ ! -f "$PROJECT_DIR/.env" ]; then
     echo "Warning: .env file not found in $PROJECT_DIR."
     echo "Ensure you have configured your API keys before starting the service."
 else
     secure_private_file "$PROJECT_DIR/.env"
 fi
+
+for ENV_CANDIDATE in "$PROJECT_DIR"/.env.*; do
+    [ -e "$ENV_CANDIDATE" ] || continue
+    [ "$ENV_CANDIDATE" = "$PROJECT_DIR/.env.example" ] && continue
+    secure_private_file "$ENV_CANDIDATE"
+done
 
 # Check if the exact Telethon session file exists (Telethon needs interactive login once)
 SESSION_FILE="$PROJECT_DIR/digest_session.session"
@@ -58,11 +58,23 @@ else
     secure_private_file "$SESSION_FILE"
 fi
 
-for SESSION_CANDIDATE in "$PROJECT_DIR"/*.session; do
+for DB_CANDIDATE in "$PROJECT_DIR"/digest_bot.db "$PROJECT_DIR"/digest_bot.db-journal "$PROJECT_DIR"/digest_bot.db-wal "$PROJECT_DIR"/digest_bot.db-shm; do
+    [ -e "$DB_CANDIDATE" ] || continue
+    secure_private_file "$DB_CANDIDATE"
+done
+
+for SESSION_CANDIDATE in "$PROJECT_DIR"/*.session "$PROJECT_DIR"/*.session-journal "$PROJECT_DIR"/*.session-wal "$PROJECT_DIR"/*.session-shm; do
     [ -e "$SESSION_CANDIDATE" ] || continue
     [ "$SESSION_CANDIDATE" = "$SESSION_FILE" ] && continue
     secure_private_file "$SESSION_CANDIDATE"
 done
+
+# Check if venv exists
+if [ ! -f "$VENV_PYTHON" ]; then
+    echo "Error: Virtual environment not found at $PROJECT_DIR/venv"
+    echo "Please create it first: python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt"
+    exit 1
+fi
 
 # Generate the service file content
 SERVICE_FILE_CONTENT="[Unit]
@@ -85,7 +97,7 @@ SyslogIdentifier=$SERVICE_NAME
 WantedBy=multi-user.target"
 
 # Write to file
-echo "$SERVICE_FILE_CONTENT" > "$SERVICE_NAME.service"
+echo "$SERVICE_FILE_CONTENT" > "$PROJECT_DIR/$SERVICE_NAME.service"
 
 echo "Service file '$SERVICE_NAME.service' has been generated."
 echo ""

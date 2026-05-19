@@ -83,5 +83,5 @@ The bot will also automatically generate and send a digest to your Saved Message
 Run the automated tests with:
 
 ```bash
-python -m unittest discover -s tests
+venv/bin/python -m unittest discover -s tests
 ```

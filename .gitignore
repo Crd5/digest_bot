@@ -2,6 +2,8 @@
 venv/
 env/
 .env
+.env.*
+!.env.example
 
 # Python Cache
 __pycache__/
@@ -9,16 +11,22 @@ __pycache__/
 
 # Database
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 *.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
 
 # Telethon Sessions
 *.session
 *.session-journal
+*.session-wal
+*.session-shm
 
 # Logs
 *.log
 
 # Systemd
 *.service
-
-GEMINI.md
