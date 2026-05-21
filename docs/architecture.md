@@ -1,94 +1,74 @@
 # Architecture
 
-The Telegram Digest Bot is a Telegram user bot that reads selected chats and channels, summarizes new messages with Gemini, and sends a digest to the user's Saved Messages.
+The Telegram Read-Only AI Assistant is one async Python service with two Telegram integrations:
+
+- Telegram Bot API is the private owner interface.
+- Telethon is the read-only data plane for selected chats and channels.
+
+The service does not schedule proactive digests in V1. It replies only when the configured owner asks through the Bot API.
 
 ## Runtime Components
 
-- `main.py` owns the runtime. It loads environment variables, initializes Telethon and Gemini clients, registers command handlers, schedules the daily digest, collects messages, summarizes content, and sends output.
-- `database.py` owns local SQLite persistence. It stores target chats and per-chat cursor state.
-- `setup_service.sh` generates a Linux `systemd` service file for long-running deployments.
-- `tests/test_digest_behavior.py` captures the expected digest, cursor, safety, service, and database behavior.
+- `main.py` loads environment variables, initializes Telethon and Gemini, initializes SQLite, composes services, and starts Bot API polling.
+- `bot_frontend.py` owns owner-only command handling. Authorization happens before service calls.
+- `telegram_gateway.py` wraps Telethon behind a read-only interface for entity resolution, peer IDs, latest message IDs, and history reads.
+- `tracker_service.py` manages tracked chats.
+- `sync_service.py` ingests new tracked-chat messages into SQLite and advances per-chat cursors only after successful processing.
+- `assistant_service.py` searches indexed messages, builds untrusted-data prompts, formats grounded answers, and creates on-demand digests.
+- `ai_model.py` adapts Gemini to the assistant interface.
+- `database.py` owns tracked chats, cursor state, indexed messages, and SQLite FTS search.
 
 ## Startup Flow
 
 `main()` calls `initialize_runtime()`, which:
 
-1. Sets `umask(0o077)` so newly created local files default to private permissions.
+1. Sets `umask(0o077)`.
 2. Loads `.env`.
 3. Restricts existing private file permissions.
-4. Reads `API_ID`, `API_HASH`, and `GEMINI_API_KEY`.
-5. Validates that `API_ID` is an integer.
-6. Creates the Telethon `TelegramClient`.
-7. Creates the Gemini client.
-8. Initializes the SQLite database.
-9. Restricts private file permissions again.
+4. Reads `API_ID`, `API_HASH`, `GEMINI_API_KEY`, `BOT_TOKEN`, and `OWNER_TELEGRAM_USER_ID`.
+5. Validates numeric IDs.
+6. Creates the Telethon client and Gemini client.
+7. Initializes SQLite.
+8. Restricts private file permissions again.
 
-After startup, `main()` starts the Telegram client, registers command handlers, schedules the daily digest, and waits until disconnected.
+After startup, Telethon authenticates as the user client, then Bot API polling starts for owner commands.
 
-## Telegram Commands
+## Bot API Commands
 
-Commands are handled in Saved Messages (`chats='me'`):
+The Bot API front end supports:
 
-- `/add <chat>` resolves a username or numeric ID, records the marked Telegram peer ID, and starts tracking from the latest message visible at add time.
-- `/remove <chat>` resolves a chat or numeric ID and removes it from tracking.
-- `/list` lists tracked chats.
-- `/digest` sends a manual preview digest without advancing cursors.
+- `/start` and `/help`
+- `/track_add <chat>`
+- `/track_remove <chat_or_id>`
+- `/track_list`
+- `/sync`
+- `/search <query>`
+- `/ask <question>`
+- `/digest [today|since YYYY-MM-DD]`
 
-Command status messages are cleaned up after short delays to keep Saved Messages tidy.
+Plain owner text messages are treated like `/ask`.
 
-## Digest Flow
+Non-owner updates receive no reply and do not reach AI, database, or Telethon services.
 
-Scheduled and manual digests share the same core path:
+## Read-Only Telethon Boundary
 
-1. `build_digest_result()` loads target chats from SQLite.
-2. It captures a run-start timestamp.
-3. It collects messages for each chat with `collect_chat_messages()`.
-4. It formats text entries as `[timestamp] sender: text`.
-5. It splits large chat inputs with `split_text_entries()`.
-6. It summarizes chunks through Gemini with a concurrency limit.
-7. It renders a single digest text with warnings for fetch failures.
-8. `send_digest()` splits long Telegram output into safe message parts and sends each part with `parse_mode=None`.
-9. Scheduled sends commit cursor updates only after all message parts send successfully.
+Telethon is available only through `ReadOnlyTelegramGateway`. The gateway exposes read methods for resolving chats and collecting messages. Production code must not call Telethon mutation methods such as sends, deletes, forwards, edits, reactions, joins, or file sends.
 
-## Cursor Semantics
+Newly tracked chats start from the latest visible message ID at add time. `/sync` collects messages newer than the stored cursor and excludes messages newer than the run-start snapshot.
 
-Cursor state is stored per chat:
+## Local Index And Retrieval
 
-- `last_digest_timestamp`
-- `last_digest_message_id`
+SQLite stores:
 
-The message ID cursor prevents missing messages that share the same timestamp second. Timestamp-only legacy cursors still include same-second messages so they can be upgraded safely.
+- `target_chats`: chat ID, title, timestamp cursor, and message ID cursor.
+- `indexed_messages`: local raw text index for tracked Telegram messages.
+- `indexed_messages_fts`: SQLite FTS5 search table.
+- `state`: legacy global cursor state used only for migration.
 
-Important rules:
+`/sync` is idempotent through the `(chat_id, message_id)` primary key. Search and Q&A use FTS over the local index. Gemini receives only retrieved evidence or requested digest windows, not arbitrary full history.
 
-- Manual `/digest` previews do not advance cursors.
-- Scheduled digest sends advance cursors only after every Telegram message part is sent successfully.
-- Fetch failures do not advance the failed chat.
-- Summary failures do not advance the affected chat.
-- Cursors are independent per chat; one failing chat must not block cursor updates for successful chats.
-- Messages newer than the run-start snapshot are excluded so in-flight messages are not partially digested.
+## AI Prompt Safety
 
-## Gemini Summarization
+Assistant prompts wrap questions and evidence in JSON and explicitly mark the payload as untrusted data. Telegram titles, sender names, message text, and owner questions are treated as content, not instructions.
 
-`build_summary_prompt()` wraps chat title and message text in a JSON payload and explicitly tells Gemini to treat those values as untrusted data. This protects against prompt injection from Telegram message content.
-
-`generate_digest_summary()` calls Gemini and rejects empty summaries. `summarize_chat()` converts API failures into per-chat error text and marks the summary as failed so the chat cursor is not advanced.
-
-## Telegram Output Safety
-
-Digest and command output should be sent with `parse_mode=None` when it can include user-controlled or AI-generated text. This prevents Telegram Markdown parsing from turning arbitrary text into spoofed links, mentions, or formatting.
-
-Long outgoing messages are split with `split_telegram_message()` to stay below Telegram's message length limit.
-
-## Persistence
-
-`database.init_db()` creates and migrates:
-
-- `target_chats`: target chat ID, title, timestamp cursor, and message ID cursor.
-- `state`: legacy global cursor state used only for migration from older databases.
-
-When adding a chat, `add_target_chat()` updates the title for existing chats without resetting existing cursor state. New chats start from the latest visible message at add time.
-
-## Scheduling
-
-`APScheduler` runs `send_digest()` at `19:00 UTC`, which corresponds to `22:00 UTC+3`.
+Answers include source metadata so the owner can see which indexed messages grounded the response.

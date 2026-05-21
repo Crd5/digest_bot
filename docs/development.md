@@ -1,11 +1,13 @@
 # Development
 
-This project is a compact Python Telegram user bot. The runtime code lives mostly in `main.py`; SQLite persistence lives in `database.py`; behavior tests live in `tests/test_digest_behavior.py`.
+This project is a compact Python Telegram assistant. The runtime is composed from small modules instead of a single command-handler file.
 
 ## Requirements
 
 - Python 3.9 or newer.
 - Telegram API ID and API hash from https://my.telegram.org/.
+- Telegram Bot API token from BotFather.
+- Numeric Telegram owner user ID.
 - Google Gemini API key.
 - A local virtual environment named `venv`.
 
@@ -31,11 +33,13 @@ Edit `.env` with:
 API_ID=your_api_id
 API_HASH=your_api_hash
 GEMINI_API_KEY=your_gemini_api_key
+BOT_TOKEN=your_bot_api_token
+OWNER_TELEGRAM_USER_ID=your_numeric_telegram_user_id
 ```
 
 Keep `.env` private. It is ignored by git.
 
-## Running The Bot
+## Running The Assistant
 
 After configuring `.env`, run:
 
@@ -54,33 +58,39 @@ Run the complete test suite with:
 venv/bin/python -m unittest discover -s tests
 ```
 
-The tests use fakes for Telegram, Gemini, and SQLite behavior where possible. They also verify repo hygiene such as ignored private artifacts and the documented test command.
+The tests use fakes for Bot API, Telethon, Gemini, and SQLite behavior where possible. They also verify repo hygiene, read-only Telethon safety, and the documented test command.
 
 ## Development Workflow
 
 Before changing behavior:
 
-1. Read [Architecture](architecture.md) for cursor and digest semantics.
+1. Read [Architecture](architecture.md) for the Bot API, Telethon, index, and assistant boundaries.
 2. Read [Agent Notes](agent-notes.md) for invariants that future agents must preserve.
-3. Add or update tests in `tests/test_digest_behavior.py` for behavior changes.
+3. Add or update tests for behavior changes.
 4. Run `venv/bin/python -m unittest discover -s tests`.
 
-For documentation-only changes, still run the test suite because repo hygiene tests inspect `README.md` and `GEMINI.md`.
+For documentation-only changes, still run the test suite because repo hygiene tests inspect `README.md`, `GEMINI.md`, and `.env.example`.
 
 ## Code Map
 
-- `main.py`: initializes runtime clients, registers Telegram command handlers, schedules daily digests, collects messages, calls Gemini, sends digest output, and advances cursors.
-- `database.py`: owns SQLite schema creation, migration from older global cursor state, target chat CRUD, and per-chat cursor updates.
-- `setup_service.sh`: generates a `systemd` unit and restricts local private file permissions before service setup.
-- `tests/test_digest_behavior.py`: tests digest flow, cursor semantics, prompt safety, Telegram output safety, command cleanup, service generation, repo hygiene, and database migrations.
+- `main.py`: runtime initialization and service composition.
+- `bot_frontend.py`: owner-only Bot API commands and plain-text replies.
+- `telegram_gateway.py`: read-only Telethon history access and cursor-safe collection.
+- `tracker_service.py`: tracked chat add/remove/list behavior.
+- `sync_service.py`: tracked-chat ingestion into SQLite.
+- `assistant_service.py`: FTS retrieval, Gemini prompts, search formatting, and digests.
+- `ai_model.py`: Gemini SDK adapter.
+- `database.py`: SQLite schema, migrations, tracked chats, indexed messages, and FTS.
+- `setup_service.sh`: `systemd` unit generation and private-file permission hardening.
+- `tests/`: behavior, safety, service setup, repo hygiene, and database migration tests.
 
 ## Dependency Notes
 
 Dependencies are pinned in `requirements.txt`:
 
 - `Telethon`: Telegram MTProto user-client library.
+- `python-telegram-bot`: Bot API polling and command handling.
 - `google-genai`: Gemini SDK.
-- `APScheduler`: async daily scheduling.
 - `python-dotenv`: `.env` loading.
 
 Avoid adding dependencies for small helpers unless they remove meaningful complexity.
@@ -93,4 +103,4 @@ Do not commit or print:
 - `*.session*` Telethon files.
 - `digest_bot.db` or SQLite sidecars.
 - Generated `*.service` files.
-- Logs containing chat content, sender names, credentials, or summaries.
+- Logs containing chat content, sender names, credentials, indexed messages, or AI responses.

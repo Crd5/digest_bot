@@ -1,23 +1,24 @@
-# Telegram Digest Bot
+# Telegram Read-Only AI Assistant
 
-A Telegram user bot that summarizes selected chats and channels into daily highlights using Telethon and Google Gemini.
+An owner-only Telegram AI assistant with a Telegram Bot API front end and a read-only Telethon back end.
 
-The bot runs from your Telegram account, listens for commands in Saved Messages, and sends digest output back to Saved Messages.
+The assistant can reply only to your configured Bot API owner account. Telethon is used only to read selected chats and channels into a local SQLite index; it must not send, delete, forward, edit, react, join, or otherwise mutate Telegram state.
 
 ## Features
 
-- Daily scheduled digest at `22:00 UTC+3`.
-- Manual `/digest` preview on demand.
-- Dynamic tracked-chat management from Telegram.
-- Per-chat cursors so one failing chat does not corrupt the others.
-- Plain-text Telegram output for safer handling of AI-generated and user-controlled content.
-- Local SQLite state with private file permission hardening.
+- Private Telegram Bot API interface restricted by `OWNER_TELEGRAM_USER_ID`.
+- Explicit tracked-chat management.
+- Read-only Telethon ingestion for selected chats/channels.
+- Local SQLite message index with FTS search.
+- Gemini-powered Q&A and on-demand digests grounded in indexed Telegram messages.
+- No scheduled proactive sends in V1; the bot replies only when you ask.
+- Private file permission hardening for `.env`, sessions, and SQLite state.
 
 ## Privacy And Security
 
-Tracked Telegram message text, sender names, and chat titles are sent to the Google Gemini API for summarization. Only add chats whose contents you are comfortable processing with an external AI service.
+Tracked Telegram message text, sender names, and chat titles are stored locally in SQLite. Retrieved snippets are sent to the Google Gemini API when you ask questions or generate digests. Only track chats whose contents you are comfortable processing this way.
 
-Keep `.env`, `*.session*`, and `*.db*` files private. They contain credentials, Telegram login state, or local chat tracking state.
+Keep `.env`, `*.session*`, and `*.db*` files private. They contain credentials, Telegram login state, or indexed chat content.
 
 ```bash
 chmod 600 .env *.session digest_bot.db* 2>/dev/null || true
@@ -27,6 +28,8 @@ chmod 600 .env *.session digest_bot.db* 2>/dev/null || true
 
 - Python 3.9 or newer.
 - Telegram API ID and API hash from https://my.telegram.org/.
+- Telegram Bot API token from BotFather.
+- Your numeric Telegram user ID for `OWNER_TELEGRAM_USER_ID`.
 - Google Gemini API key.
 
 ## Quickstart
@@ -51,9 +54,11 @@ Fill in:
 API_ID=your_api_id
 API_HASH=your_api_hash
 GEMINI_API_KEY=your_gemini_api_key
+BOT_TOKEN=your_bot_api_token
+OWNER_TELEGRAM_USER_ID=your_numeric_telegram_user_id
 ```
 
-Run the bot:
+Run the assistant:
 
 ```bash
 source venv/bin/activate
@@ -64,12 +69,18 @@ On first run, Telethon asks for Telegram login details and creates `digest_sessi
 
 ## Telegram Commands
 
-Send commands to your Saved Messages:
+Send commands to your private Bot API chat:
 
-- `/add <chat_username_or_id>`: add a chat or channel. Tracking starts from the latest visible message at add time; older history is not backfilled.
-- `/remove <chat_username_or_id>`: remove a tracked chat or channel.
-- `/list`: list tracked chats.
-- `/digest`: preview a digest without advancing scheduled digest cursors.
+- `/start` or `/help`: show available commands.
+- `/track_add <chat_username_or_id>`: add a chat or channel. Tracking starts from the latest visible message at add time.
+- `/track_remove <chat_username_or_id>`: remove a tracked chat or channel.
+- `/track_list`: list tracked chats.
+- `/sync`: read new messages from tracked chats into the local SQLite index.
+- `/search <query>`: search locally indexed messages.
+- `/ask <question>`: answer from indexed Telegram evidence.
+- `/digest [today|since YYYY-MM-DD]`: generate an on-demand digest from indexed messages.
+
+Plain text owner messages are treated like `/ask`.
 
 ## Linux Service
 

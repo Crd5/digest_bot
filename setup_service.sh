@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Telegram Digest Bot - Service Setup Script
+# Telegram Read-Only AI Assistant - Service Setup Script
 # This script generates a systemd service file for the bot.
 
 # Get the absolute path of the project directory
@@ -32,7 +32,7 @@ secure_private_file() {
 SYSTEMD_PROJECT_DIR=$(systemd_quote "$PROJECT_DIR")
 SYSTEMD_VENV_PYTHON=$(systemd_quote "$VENV_PYTHON")
 
-echo "--- Telegram Digest Bot Service Setup ---"
+echo "--- Telegram Read-Only AI Assistant Service Setup ---"
 
 # Restrict local secrets before any early exit.
 if [ ! -f "$PROJECT_DIR/.env" ]; then
@@ -78,7 +78,7 @@ fi
 
 # Generate the service file content
 SERVICE_FILE_CONTENT="[Unit]
-Description=Telegram Digest Bot
+Description=Telegram Read-Only AI Assistant
 After=network.target
 
 [Service]
